@@ -25,13 +25,26 @@ static void Sharp(float bias, uint32_t ss[4]) {
 
 // Returns the level (0 red, 1 green, 2 blue, -1 other) read at the center of a size x size target.
 static int LevelRead(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLRenderPipelineState> pso, id<MTLTexture> tex,
-                     float bias, uint32_t size) {
+                     float bias, uint32_t size, int mode) {
     uint32_t ss[4];
     Sharp(bias, ss);
     ps4gnm::SamplerDesc sd;
     Check(ps4gnm::DecodeSampler(ss, &sd), "decode the S#");
     Check(sd.lod_bias == bias, "decoded LOD bias");
-    id<MTLSamplerState> smp = [dev newSamplerStateWithDescriptor:ps4gnm::MakeSamplerDescriptor(sd, false)];
+    MTLSamplerDescriptor* sampler = mode == 0 ? ps4gnm::MakeSamplerDescriptor(sd, false) : [MTLSamplerDescriptor new];
+    if (mode != 0) {
+        sampler.mipFilter = MTLSamplerMipFilterNearest;
+        sampler.lodMaxClamp = 2.f;
+        if (@available(macOS 26.0, *)) sampler.lodBias = mode <= 2 ? bias : 0.f;
+        sampler.supportArgumentBuffers = mode == 2;
+        if (mode == 3) sampler.lodMinClamp = 2.f;
+    }
+    if (@available(macOS 26.0, *)) {
+        printf("mode=%d size=%u descriptor bias=%.2f min=%.2f max=%.2f argbuf=%d ", mode, size,
+               sampler.lodBias, sampler.lodMinClamp, sampler.lodMaxClamp, sampler.supportArgumentBuffers);
+    }
+    id<MTLSamplerState> smp = [dev newSamplerStateWithDescriptor:sampler];
+    Check(smp != nil, "create sampler");
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                   width:size height:size mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
@@ -46,10 +59,13 @@ static int LevelRead(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLRenderPipel
     [re setRenderPipelineState:pso];
     [re setFragmentTexture:tex atIndex:0];
     [re setFragmentSamplerState:smp atIndex:0];
+    [re setFragmentBytes:&bias length:sizeof(bias) atIndex:0];
     [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [re endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    if (cb.error) fprintf(stderr, "Metal command failed: %s\n", cb.error.description.UTF8String);
+    Check(cb.status == MTLCommandBufferStatusCompleted, "render completed");
     uint8_t px[4];
     [rt getBytes:px bytesPerRow:size * 4 fromRegion:MTLRegionMake2D(size / 2, size / 2, 1, 1) mipmapLevel:0];
     if (px[0] == 255 && px[1] == 0 && px[2] == 0) return 0;
@@ -70,6 +86,7 @@ int main() {
             fprintf(stderr, "Metal samplers have no LOD bias before macOS 26\n");
             return 77;
         }
+        printf("Metal device: %s; MTLGPUFamilyApple7=%d\n", dev.name.UTF8String, [dev supportsFamily:MTLGPUFamilyApple7]);
         NSError* error = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:@R"(
 #include <metal_stdlib>
@@ -82,6 +99,10 @@ vertex V vs(uint i [[vertex_id]]) {
 fragment float4 fs(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
     return t.sample(s, v.uv);
 }
+fragment float4 fs_bias(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                        constant float& delta [[buffer(0)]]) {
+    return t.sample(s, v.uv, metal::bias(delta));
+}
 )" options:nil error:&error];
         Check(lib != nil, "compile the regression shaders");
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
@@ -90,6 +111,9 @@ fragment float4 fs(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler 
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
         id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&error];
         Check(pso != nil, "render pipeline");
+        pd.fragmentFunction = [lib newFunctionWithName:@"fs_bias"];
+        id<MTLRenderPipelineState> biasPso = [dev newRenderPipelineStateWithDescriptor:pd error:&error];
+        Check(biasPso != nil, "shader bias pipeline");
 
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                       width:4 height:4 mipmapped:YES];
@@ -111,12 +135,19 @@ fragment float4 fs(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler 
                      {1.25f, 4, 1, "LOD 0 with bias +1.25 reads level 1"},
                      {0.f, 1, 2, "LOD 2 without bias reads level 2"},
                      {-0.75f, 1, 1, "LOD 2 with bias -0.75 reads level 1"}};
-        for (const auto& c : cases) {
-            const int got = LevelRead(dev, q, pso, tex, c.bias, c.size);
-            if (got != c.level) fprintf(stderr, "read level %d\n", got);
-            Check(got == c.level, c.name);
+        int failures = 0;
+        for (int mode = 0; mode < 5; ++mode) {
+            for (const auto& c : cases) {
+                const int got = LevelRead(dev, q, mode == 4 ? biasPso : pso, tex, c.bias, c.size, mode);
+                const int expected = mode == 3 ? 2 : c.level;
+                printf("got=%d expected=%d: %s\n", got, expected, c.name);
+                failures += got != expected;
+            }
+            int got = LevelRead(dev, q, mode == 4 ? biasPso : pso, tex, 1.25f, 2, mode);
+            printf("got=%d expected=2: LOD 1 with bias +1.25\n", got);
+            failures += got != 2;
         }
-        printf("sampler LOD bias: levels move with the S# bias\n");
+        Check(failures == 0, "one or more LOD controls differed");
     }
     return 0;
 }

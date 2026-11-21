@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - diag/sampler-lod-bias-runner
 
 permissions:
   contents: read
@@ -27,11 +28,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test -count=1 ./...
+      - name: Compare native Metal LOD controls
+        run: |
+          sw_vers
+          xcodebuild -version
+          clang++ -std=c++17 -fobjc-arc -O2 -Wl,-dead_strip \
+            -Ipkg/runtime/modules/libSceGnmDriver -Ipkg/runtime/core \
+            tests/gnm_metal_test/sampler_lod_bias.mm \
+            pkg/runtime/modules/libSceGnmDriver/ps4_gnm_resources.mm \
+            -framework Metal -framework Foundation -o "$RUNNER_TEMP/lod-probe"
+          "$RUNNER_TEMP/lod-probe"
